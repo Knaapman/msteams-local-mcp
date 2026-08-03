@@ -244,7 +244,7 @@ class TeamsCacheReader:
                     )
 
     def conversations(self, account: Optional[str] = None) -> Iterator[dict]:
-        """Yield chat/channel metadata records (title, members, id…)."""
+        """Yield chat/channel metadata records (title, members, id, last time…)."""
         for acc, obj in self._stores("conversation-manager", "conversations"):
             if account and acc.key != account:
                 continue
@@ -252,14 +252,37 @@ class TeamsCacheReader:
                 if rec.value is None:
                     continue
                 v = rec.value
+                tp = v.get("threadProperties") or {}
+                last = v.get("lastMessage") if isinstance(v.get("lastMessage"), dict) else {}
                 yield {
                     "account": acc.key,
                     "id": str(v.get("id", "")),
-                    "title": _text(v.get("title") or v.get("topic")),
+                    # The display title lives in threadProperties.topic (channels/named
+                    # group chats). 1:1 chats have no topic — the caller can fall back
+                    # to member names.
+                    "title": _text((tp.get("topic") if isinstance(tp, dict) else "") or ""),
                     "type": str(v.get("type", "")),
-                    "last_message": _text(
-                        (v.get("lastMessage") or {}).get("content")
-                        if isinstance(v.get("lastMessage"), dict)
-                        else ""
-                    ),
+                    "last_message_time": str(v.get("lastMessageTimeUtc", "")),
+                    "last_message": _text(last.get("content") if last else ""),
+                }
+
+    def mentions(self, account: Optional[str] = None) -> Iterator[dict]:
+        """Yield @-mention entries (read state included). The only reliable read
+        marker in the cache: general read/unread is NOT stored locally, but each
+        mention carries ``is_read``. Content is not here — join on
+        (conversation_id, message_id) with :meth:`messages`."""
+        for acc, obj in self._stores("messaging-slice-manager", "mentions-metadata-items"):
+            if account and acc.key != account:
+                continue
+            for rec in obj.iterate_records(bad_deserializer_data_handler=self._on_bad):
+                if rec.value is None or not isinstance(rec.value, dict):
+                    continue
+                v = rec.value
+                yield {
+                    "account": acc.key,
+                    "conversation_id": str(v.get("sourceThreadId", "")),
+                    "message_id": str(v.get("sourceMessageId", "")),
+                    "reply_chain_id": str(v.get("sourceReplyChainId", "")),
+                    "timestamp": str(v.get("timestamp", "")),
+                    "is_read": str(v.get("isRead")) == "True",
                 }
