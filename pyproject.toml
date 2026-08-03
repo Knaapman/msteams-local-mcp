@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "msteams-local-mcp"
+version = "0.1.0"
+description = "Read the new Microsoft Teams (v2) message cache locally, and expose it over MCP — no Microsoft Graph, no OAuth, no network."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["microsoft-teams", "mcp", "indexeddb", "leveldb", "webview2", "local", "forensics"]
+authors = [{ name = "KamorionLabs" }]
+classifiers = [
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+]
+dependencies = [
+  # Low-level Chromium LevelDB + V8 parsing (MIT). Not on PyPI → pulled from git.
+  "ccl_chromium_reader @ git+https://github.com/cclgroupltd/ccl_chromium_reader@master",
+  "mcp>=1.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+msteams-local-mcp = "msteams_local_mcp.server:main"
+msteams-local-dump = "msteams_local_mcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/KamorionLabs/msteams-local-mcp"
+Issues = "https://github.com/KamorionLabs/msteams-local-mcp/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
