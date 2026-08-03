@@ -75,10 +75,23 @@ Tools exposed (all read-only):
 
 | Tool | Purpose |
 |------|---------|
-| `list_accounts` | the tenant/user contexts in the cache, with an inferred org label |
-| `list_conversations` | chats/channels (id, title, type), optional `account` filter |
+| `overview` | who messaged you: recent activity grouped by conversation (best first call) |
+| `recent_messages` | messages received in the last N days, newest first — one call for "what did I miss" |
+| `mentions` | @-mentions of you (with content + read state); `unread_only` filter |
+| `unread_messages` | your unread @-mentions (the only reliable unread signal — see note) |
+| `search_messages` | substring search across messages, optional `days` recency |
 | `read_conversation` | messages of one conversation (newest last) |
-| `search_messages` | case-insensitive substring search across all cached messages |
+| `list_conversations` | chats/channels (id, title, type) |
+| `list_accounts` | the tenant/user contexts, with an inferred org label |
+
+All accept an optional `account` filter (a key from `list_accounts`) to scope to one
+tenant/org. **Note on unread:** the local cache stores no general per-message read
+marker, so true "all unread" can't be derived; `unread_messages` returns unread
+@-mentions, and `recent_messages` covers "everything received while I was away".
+
+Performance: the LevelDB is parsed once and cached (in memory + on disk, keyed on
+the store's signature), so chained calls are near-instant and re-parsing happens only
+when Teams writes new data.
 
 ## Scope, limits & ethics
 
