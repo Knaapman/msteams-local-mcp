@@ -15,11 +15,17 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+# The high-level server class was FastMCP in the mcp SDK 1.x and was renamed
+# MCPServer in 2.0 (same API: name arg, .tool() decorator, .run() defaulting to
+# stdio). Support both so the package works regardless of the installed SDK.
+try:
+    from mcp.server.fastmcp import FastMCP as _MCPServer  # mcp < 2
+except ImportError:  # pragma: no cover
+    from mcp.server.mcpserver import MCPServer as _MCPServer  # mcp >= 2
 
 from .reader import TeamsCacheReader
 
-mcp = FastMCP("msteams-local")
+mcp = _MCPServer("msteams-local")
 
 _LEVELDB = os.environ.get("MSTEAMS_LEVELDB") or None
 
