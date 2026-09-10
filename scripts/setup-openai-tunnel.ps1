@@ -28,15 +28,15 @@ if ([string]::IsNullOrWhiteSpace($env:CONTROL_PLANE_API_KEY)) {
 
 $TunnelClientPath = Require-Command -Name $TunnelClient
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-$Launcher = Join-Path $RepoRoot "run-chatgpt.cmd"
+$McpExecutablePath = Join-Path $RepoRoot ".venv\Scripts\msteams-local-mcp.exe"
 
-if (-not (Test-Path $Launcher)) {
-    throw "Windows launcher not found at '$Launcher'. Run git pull and retry."
+if (-not (Test-Path $McpExecutablePath)) {
+    throw "Teams MCP executable not found at '$McpExecutablePath'. Create the virtual environment and install the project first."
 }
 
 Write-Host "Using existing CONTROL_PLANE_API_KEY from the environment."
 Write-Host "Tunnel client: $TunnelClientPath"
-Write-Host "Teams launcher: $Launcher"
+Write-Host "Teams MCP:     $McpExecutablePath"
 Write-Host "Profile:       $ProfileName"
 Write-Host "Tunnel ID:     $TunnelId"
 Write-Host "Health listen: $HealthListenAddr"
@@ -51,7 +51,11 @@ if (-not $SkipLocalSmokeTest) {
     }
 }
 
-$mcpCommand = 'cmd.exe /d /c "' + $Launcher + '"'
+# tunnel-client's command parser treats backslashes as escapes except inside
+# single-quoted command tokens. Include literal single quotes in the value so a
+# Windows path reaches exec.Command unchanged. The quotes are parser syntax and
+# are not part of argv[0].
+$mcpCommand = "'" + $McpExecutablePath + "'"
 
 Write-Host ""
 Write-Host "Creating or refreshing tunnel-client profile '$ProfileName'..."
