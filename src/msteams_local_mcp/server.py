@@ -1,21 +1,8 @@
-"""MCP server exposing the local Microsoft Teams (v2) message cache read-only.
+"""MCP server exposing the local Microsoft Teams (v2) cache plus local desktop writes.
 
-Runs over stdio. Tools:
-  - ``list_accounts``      the (tenant, user) contexts present in the cache
-  - ``list_conversations`` chats/channels, optionally per account
-  - ``read_conversation``  messages of one conversation, newest last
-  - ``search_messages``    substring search across cached messages (optional recency)
-  - ``recent_messages``    messages received in the last N days (one call)
-
-All data is read from the local disk only (no Graph, no network). Set
-``MSTEAMS_LEVELDB`` to point at a specific LevelDB directory; otherwise the cache
-is auto-discovered for the current OS.
-
-Performance: the LevelDB is cold-copied and fully parsed ONCE, then cached in
-memory for ``MSTEAMS_CACHE_TTL`` seconds (default 180). Without this, every tool
-call re-copied ~30 MB and re-parsed ~thousands of messages — a single agent
-request that chained many calls took minutes. With the cache, the first call pays
-the parse cost and the rest are in-memory.
+Reads come from the local Teams IndexedDB cache. Optional Windows writes drive the
+already signed-in Teams desktop client via Windows UI Automation; no Microsoft Graph,
+OAuth, Azure app registration, or Teams token scraping is used.
 """
 from __future__ import annotations
 
@@ -25,41 +12,54 @@ import json
 import os
 import pathlib
 import re
-import tempfile
 import time
 from collections import Counter
 from typing import Optional
 
-# The high-level server class was FastMCP in the mcp SDK 1.x and was renamed
-# MCPServer in 2.0 (same API: name arg, .tool() decorator, .run() defaulting to
-# stdio). Support both so the package works regardless of the installed SDK.
 try:
     from mcp.server.fastmcp import FastMCP as _MCPServer  # mcp < 2
 except ImportError:  # pragma: no cover
     from mcp.server.mcpserver import MCPServer as _MCPServer  # mcp >= 2
 
+from mcp.types import ToolAnnotations
+
 from .reader import Message, TeamsCacheReader, find_cache
+from .writer import (
+    LocalTeamsWriteError,
+    local_write_status as _local_write_status,
+    send_chat_message as _send_chat_message,
+)
 
 mcp = _MCPServer("msteams-local")
 
+_READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+_WRITE_SEND = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=False,
+    open_world_hint=True,
+)
+
 _LEVELDB = os.environ.get("MSTEAMS_LEVELDB") or None
 _TTL = float(os.environ.get("MSTEAMS_CACHE_TTL", "180"))
-_MAXLEN = int(os.environ.get("MSTEAMS_MAX_CONTENT", "600"))  # truncate long bodies in output
+_MAXLEN = int(os.environ.get("MSTEAMS_MAX_CONTENT", "600"))
 _CACHE_FILE = pathlib.Path(
     os.environ.get("MSTEAMS_CACHE_DIR")
     or (pathlib.Path.home() / ".cache" / "msteams-local-mcp")
 ) / "snapshot.json"
 
-# In-memory snapshot: parse once, reuse for _TTL seconds across tool calls.
 _snap: dict = {
-    "ts": 0.0, "sig": "", "messages": [], "conversations": [],
-    "accounts": [], "mentions": [], "skipped": 0,
+    "ts": 0.0,
+    "sig": "",
+    "messages": [],
+    "conversations": [],
+    "accounts": [],
+    "mentions": [],
+    "skipped": 0,
 }
 
 
 def _signature(leveldb: str) -> str:
-    """Cheap fingerprint of the LevelDB — newest mtime + total size. Changes only
-    when Teams actually writes new data, so we re-parse only then."""
     files = glob.glob(os.path.join(leveldb, "*"))
     if not files:
         return ""
@@ -69,7 +69,6 @@ def _signature(leveldb: str) -> str:
 
 
 def _load_disk(sig: str) -> Optional[dict]:
-    """Return a previously-parsed snapshot if its signature still matches."""
     try:
         data = json.loads(_CACHE_FILE.read_text())
     except (OSError, ValueError):
@@ -94,13 +93,12 @@ def _save_disk(snap: dict) -> None:
         tmp = _CACHE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, _CACHE_FILE)
-        os.chmod(_CACHE_FILE, 0o600)  # holds message content — not world-readable
+        os.chmod(_CACHE_FILE, 0o600)
     except OSError:
         pass
 
 
 def _epoch_ms(ts: str) -> Optional[float]:
-    """Teams timestamps are epoch milliseconds (as strings like '1768557031836.0')."""
     if not ts:
         return None
     try:
@@ -115,12 +113,6 @@ def _epoch_ms(ts: str) -> Optional[float]:
 
 
 def _snapshot() -> dict:
-    """Return the parsed cache. Three tiers, cheapest first:
-    1. in-memory, if still within the TTL and the LevelDB hasn't changed;
-    2. on-disk parse, if the LevelDB signature matches (no re-parse, survives
-       process/gateway restarts);
-    3. full cold-copy + parse, only when Teams actually wrote new data.
-    """
     now = time.monotonic()
     leveldb = _LEVELDB or find_cache()
     sig = _signature(leveldb) if leveldb else ""
@@ -138,11 +130,11 @@ def _snapshot() -> dict:
         conversations = list(r.conversations())
         mentions = list(r.mentions())
         skipped = r.skipped
-    # Derive accounts (+ inferred org label) from the single messages pass.
+
     per_acc: dict[str, Counter] = {}
     for m in messages:
         c = per_acc.setdefault(m.account, Counter())
-        mm = re.search(r"\(([^)]+)\)\s*$", m.sender)  # e.g. "Name (GP Rubix)"
+        mm = re.search(r"\(([^)]+)\)\s*$", m.sender)
         if mm:
             c[mm.group(1)] += 1
     accounts = [
@@ -155,20 +147,23 @@ def _snapshot() -> dict:
         for k, c in per_acc.items()
     ]
     _snap.update(
-        ts=now, sig=sig, messages=messages, conversations=conversations,
-        accounts=accounts, mentions=mentions, skipped=skipped,
+        ts=now,
+        sig=sig,
+        messages=messages,
+        conversations=conversations,
+        accounts=accounts,
+        mentions=mentions,
+        skipped=skipped,
     )
     _save_disk(_snap)
     return _snap
 
 
 def _msg_index(snap: dict) -> dict:
-    """(account, message_id) -> Message, to attach content to mentions."""
     return {(m.account, m.message_id): m for m in snap["messages"]}
 
 
 def _title_map(snap: dict) -> dict:
-    """(account, conversation_id) -> display title (falls back to '')."""
     return {(c["account"], c["id"]): c.get("title", "") for c in snap["conversations"]}
 
 
@@ -183,19 +178,15 @@ def _fmt(m: Message) -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ)
 def list_accounts() -> list[dict]:
-    """List the Teams accounts (tenant/user contexts) in the local cache.
-
-    Each: ``key`` (use as the ``account`` filter elsewhere), ``tenant_id``,
-    ``user_id`` and a best-effort ``label`` inferred from org names in messages.
-    """
+    """List the Teams accounts (tenant/user contexts) in the local cache."""
     return _snapshot()["accounts"]
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ)
 def list_conversations(account: Optional[str] = None, limit: int = 100) -> list[dict]:
-    """List chats/channels (id, title, type), optionally filtered by ``account``."""
+    """List chats/channels (id, title, type), optionally filtered by account."""
     out = []
     for conv in _snapshot()["conversations"]:
         if account and conv.get("account") != account:
@@ -207,9 +198,13 @@ def list_conversations(account: Optional[str] = None, limit: int = 100) -> list[
     return out
 
 
-@mcp.tool()
-def read_conversation(conversation_id: str, limit: int = 50, account: Optional[str] = None) -> list[dict]:
-    """Return up to ``limit`` most recent messages of a conversation (newest last)."""
+@mcp.tool(annotations=_READ)
+def read_conversation(
+    conversation_id: str,
+    limit: int = 50,
+    account: Optional[str] = None,
+) -> list[dict]:
+    """Return up to limit most recent messages of a conversation (newest last)."""
     msgs = [
         m
         for m in _snapshot()["messages"]
@@ -219,14 +214,14 @@ def read_conversation(conversation_id: str, limit: int = 50, account: Optional[s
     return [_fmt(m) for m in msgs[-limit:]]
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ)
 def search_messages(
-    query: str, account: Optional[str] = None, days: Optional[int] = None, limit: int = 50
+    query: str,
+    account: Optional[str] = None,
+    days: Optional[int] = None,
+    limit: int = 50,
 ) -> list[dict]:
-    """Case-insensitive substring search across cached messages.
-
-    Optional ``days`` restricts to messages received in the last N days.
-    """
+    """Case-insensitive substring search across cached messages."""
     q = query.lower()
     cutoff = (time.time() - days * 86400) * 1000 if days else None
     hits = []
@@ -244,13 +239,13 @@ def search_messages(
     return hits
 
 
-@mcp.tool()
-def recent_messages(days: int = 7, account: Optional[str] = None, limit: int = 200) -> list[dict]:
-    """Messages received in the last ``days`` days, newest first — in ONE call.
-
-    Ideal for 'what did I get while I was away'. Filter by ``account`` (see
-    ``list_accounts``) to scope to one tenant/org.
-    """
+@mcp.tool(annotations=_READ)
+def recent_messages(
+    days: int = 7,
+    account: Optional[str] = None,
+    limit: int = 200,
+) -> list[dict]:
+    """Messages received in the last days days, newest first."""
     cutoff = (time.time() - days * 86400) * 1000
     hits = []
     for m in _snapshot()["messages"]:
@@ -283,7 +278,9 @@ def _mentions_impl(days, unread_only, account, limit):
             {
                 "timestamp": mt["timestamp"],
                 "is_read": mt["is_read"],
-                "conversation": titles.get((mt["account"], mt["conversation_id"]), "")
+                "conversation": titles.get(
+                    (mt["account"], mt["conversation_id"]), ""
+                )
                 or mt["conversation_id"],
                 "sender": m.sender if m else "",
                 "content": (m.content[:_MAXLEN] if m else ""),
@@ -294,38 +291,30 @@ def _mentions_impl(days, unread_only, account, limit):
     return out[:limit]
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ)
 def mentions(
-    days: Optional[int] = None, unread_only: bool = False, account: Optional[str] = None, limit: int = 100
+    days: Optional[int] = None,
+    unread_only: bool = False,
+    account: Optional[str] = None,
+    limit: int = 100,
 ) -> list[dict]:
-    """@-mentions of you (someone @mentioned you), newest first, with content.
-
-    ``unread_only`` keeps only not-yet-read mentions; ``days`` restricts recency;
-    ``account`` scopes to one tenant (see ``list_accounts``). This is the only
-    reliable read/unread signal in the local store.
-    """
+    """@-mentions of you, newest first, with content and mention read state."""
     return _mentions_impl(days, unread_only, account, limit)
 
 
-@mcp.tool()
-def unread_messages(days: int = 30, account: Optional[str] = None, limit: int = 100) -> list[dict]:
-    """Unread items needing attention = your UNREAD @-mentions.
-
-    ⚠️ The local Teams cache has NO general read marker (per-message read state is
-    not stored on disk), so true 'all unread' can't be derived. Unread @-mentions
-    are the reliable signal. For 'everything that arrived while I was away', use
-    ``recent_messages(days=...)`` instead (you read nothing while away → recent ≈ unread).
-    """
+@mcp.tool(annotations=_READ)
+def unread_messages(
+    days: int = 30,
+    account: Optional[str] = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Unread items needing attention: reliable unread @-mentions."""
     return _mentions_impl(days, True, account, limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ)
 def overview(days: int = 7, account: Optional[str] = None) -> list[dict]:
-    """Who messaged you: recent activity grouped by conversation, newest first.
-
-    Per conversation: title, message count, distinct senders, last message + time.
-    Great first call to get the lay of the land before drilling in.
-    """
+    """Recent Teams activity grouped by conversation, newest first."""
     snap = _snapshot()
     titles = _title_map(snap)
     cutoff = (time.time() - days * 86400) * 1000
@@ -337,7 +326,8 @@ def overview(days: int = 7, account: Optional[str] = None) -> list[dict]:
         if e is None or e < cutoff:
             continue
         g = convs.setdefault(
-            (m.account, m.conversation_id), {"count": 0, "senders": set(), "last_e": 0.0, "last": None}
+            (m.account, m.conversation_id),
+            {"count": 0, "senders": set(), "last_e": 0.0, "last": None},
         )
         g["count"] += 1
         if m.sender:
@@ -350,6 +340,7 @@ def overview(days: int = 7, account: Optional[str] = None) -> list[dict]:
         rows.append(
             {
                 "conversation": titles.get((acc, cid), "") or cid,
+                "conversation_id": cid,
                 "count": g["count"],
                 "senders": sorted(g["senders"])[:8],
                 "last_sender": last.sender if last else "",
@@ -360,6 +351,26 @@ def overview(days: int = 7, account: Optional[str] = None) -> list[dict]:
         )
     rows.sort(key=lambda r: _epoch_ms(r["last_time"]) or 0, reverse=True)
     return rows
+
+
+@mcp.tool(annotations=_READ, title="Check local Teams send readiness")
+def local_write_status() -> dict:
+    """Check whether Windows UI Automation can currently reach the local Teams client."""
+    return _local_write_status()
+
+
+@mcp.tool(annotations=_WRITE_SEND, title="Send Teams chat message locally")
+def send_chat_message_local(conversation_id: str, message: str) -> dict:
+    """Send a plain-text message to an existing Teams 1:1/group chat via the local desktop client.
+
+    This is a WRITE action. It sends a real Teams message as the currently signed-in local Teams
+    user. Use a conversation_id returned by this MCP's read tools. No Graph or OAuth is used.
+    Calling twice can send duplicates, so this tool is explicitly non-idempotent.
+    """
+    try:
+        return _send_chat_message(conversation_id, message)
+    except LocalTeamsWriteError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def main() -> None:
