@@ -5,6 +5,7 @@ param(
     [string]$ProfileName = "teams-local",
     [string]$TunnelClient = "tunnel-client",
     [string]$DumpExecutable = "msteams-local-dump",
+    [string]$HealthListenAddr = "127.0.0.1:0",
     [switch]$SkipLocalSmokeTest
 )
 
@@ -38,6 +39,7 @@ Write-Host "Tunnel client: $TunnelClientPath"
 Write-Host "Teams launcher: $Launcher"
 Write-Host "Profile:       $ProfileName"
 Write-Host "Tunnel ID:     $TunnelId"
+Write-Host "Health listen: $HealthListenAddr"
 
 if (-not $SkipLocalSmokeTest) {
     $DumpExecutablePath = Require-Command -Name $DumpExecutable
@@ -58,6 +60,7 @@ Write-Host "Creating or refreshing tunnel-client profile '$ProfileName'..."
     --profile $ProfileName `
     --tunnel-id $TunnelId `
     --mcp-command $mcpCommand `
+    --health-listen-addr $HealthListenAddr `
     --force
 if ($LASTEXITCODE -ne 0) {
     throw "tunnel-client init failed."
@@ -67,7 +70,7 @@ Write-Host ""
 Write-Host "Validating tunnel configuration..."
 & $TunnelClientPath doctor --profile $ProfileName --explain
 if ($LASTEXITCODE -ne 0) {
-    throw "tunnel-client doctor failed. Check the tunnel ID, runtime-key permissions, and local MCP command."
+    throw "tunnel-client doctor failed. Check the tunnel ID, runtime-key permissions, local MCP command, and health listener."
 }
 
 Write-Host ""
