@@ -4,7 +4,6 @@ param(
 
     [string]$ProfileName = "teams-local",
     [string]$TunnelClient = "tunnel-client",
-    [string]$McpExecutable = "msteams-local-mcp",
     [string]$DumpExecutable = "msteams-local-dump",
     [switch]$SkipLocalSmokeTest
 )
@@ -27,11 +26,16 @@ if ([string]::IsNullOrWhiteSpace($env:CONTROL_PLANE_API_KEY)) {
 }
 
 $TunnelClientPath = Require-Command -Name $TunnelClient
-$McpExecutablePath = Require-Command -Name $McpExecutable
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+$Launcher = Join-Path $RepoRoot "run-chatgpt.cmd"
+
+if (-not (Test-Path $Launcher)) {
+    throw "Windows launcher not found at '$Launcher'. Run git pull and retry."
+}
 
 Write-Host "Using existing CONTROL_PLANE_API_KEY from the environment."
 Write-Host "Tunnel client: $TunnelClientPath"
-Write-Host "Teams MCP:     $McpExecutablePath"
+Write-Host "Teams launcher: $Launcher"
 Write-Host "Profile:       $ProfileName"
 Write-Host "Tunnel ID:     $TunnelId"
 
@@ -45,13 +49,15 @@ if (-not $SkipLocalSmokeTest) {
     }
 }
 
+$mcpCommand = 'cmd.exe /d /c "' + $Launcher + '"'
+
 Write-Host ""
 Write-Host "Creating or refreshing tunnel-client profile '$ProfileName'..."
 & $TunnelClientPath init `
     --sample sample_mcp_stdio_local `
     --profile $ProfileName `
     --tunnel-id $TunnelId `
-    --mcp-command $McpExecutablePath `
+    --mcp-command $mcpCommand `
     --force
 if ($LASTEXITCODE -ne 0) {
     throw "tunnel-client init failed."
@@ -66,6 +72,6 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ""
 Write-Host "Teams tunnel profile is ready. Start it with:"
-Write-Host "  tunnel-client run --profile $ProfileName"
+Write-Host "  $TunnelClientPath run --profile $ProfileName"
 Write-Host ""
 Write-Host "Outlook and Teams may use the same CONTROL_PLANE_API_KEY. Keep a separate tunnel ID/profile for each local stdio MCP server."
